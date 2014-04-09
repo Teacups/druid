@@ -22,6 +22,7 @@ package io.druid.indexer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Optional;
 import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
@@ -42,6 +43,9 @@ import io.druid.segment.QueryableIndex;
 import io.druid.segment.SegmentUtils;
 import io.druid.segment.incremental.IncrementalIndex;
 import io.druid.segment.incremental.IncrementalIndexSchema;
+import io.druid.segment.loading.DataSegmentPusherUtil;
+import io.druid.storage.cassandra.CassandraDataSegmentConfig;
+import io.druid.storage.cassandra.CassandraDataSegmentPusher;
 import io.druid.timeline.DataSegment;
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configurable;
@@ -73,10 +77,12 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
+import java.util.logging.Level;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -392,118 +398,17 @@ public class IndexGeneratorJob implements Jobby
         throws IOException
     {
       Interval interval = config.getGranularitySpec().bucketInterval(bucket.time).get();
-
       int attemptNumber = context.getTaskAttemptID().getId();
-
-      FileSystem fileSystem = FileSystem.get(context.getConfiguration());
-      Path indexBasePath = config.makeSegmentOutputPath(fileSystem, bucket);
-      Path indexZipFilePath = new Path(indexBasePath, String.format("index.zip.%s", attemptNumber));
-      final FileSystem infoFS = config.makeDescriptorInfoDir().getFileSystem(context.getConfiguration());
-      final FileSystem outputFS = indexBasePath.getFileSystem(context.getConfiguration());
-
-      outputFS.mkdirs(indexBasePath);
-
-      Exception caughtException = null;
-      ZipOutputStream out = null;
-      long size = 0;
+      
       try {
-        out = new ZipOutputStream(new BufferedOutputStream(outputFS.create(indexZipFilePath), 256 * 1024));
-
-        List<String> filesToCopy = Arrays.asList(mergedBase.list());
-
-        for (String file : filesToCopy) {
-          size += copyFile(context, out, mergedBase, file);
+            URI uri = new URI(config.getSegmentOutputPath());
+            if(!uri.getScheme().equals("cassandra"))
+                serializeOutIndexForDFS( context,  bucket,  mergedBase, dimensionNames, interval,attemptNumber);
+            else
+                serializeOutIndexForCassandra(context,  bucket,  mergedBase, dimensionNames, interval,attemptNumber);
+        } catch (URISyntaxException ex) {
+            java.util.logging.Logger.getLogger(IndexGeneratorJob.class.getName()).log(Level.SEVERE, "Invalid SegmentOutputPath", ex);
         }
-      }
-      catch (Exception e) {
-        caughtException = e;
-      }
-      finally {
-        if (caughtException == null) {
-          Closeables.close(out, false);
-        } else {
-          Closeables.closeQuietly(out);
-          throw Throwables.propagate(caughtException);
-        }
-      }
-
-      Path finalIndexZipFilePath = new Path(indexBasePath, "index.zip");
-      final URI indexOutURI = finalIndexZipFilePath.toUri();
-      ImmutableMap<String, Object> loadSpec;
-      if (outputFS instanceof NativeS3FileSystem) {
-        loadSpec = ImmutableMap.<String, Object>of(
-            "type", "s3_zip",
-            "bucket", indexOutURI.getHost(),
-            "key", indexOutURI.getPath().substring(1) // remove the leading "/"
-        );
-      } else if (outputFS instanceof LocalFileSystem) {
-        loadSpec = ImmutableMap.<String, Object>of(
-            "type", "local",
-            "path", indexOutURI.getPath()
-        );
-      } else if (outputFS instanceof DistributedFileSystem) {
-        loadSpec = ImmutableMap.<String, Object>of(
-            "type", "hdfs",
-            "path", indexOutURI.getPath()
-        );
-      } else {
-        throw new ISE("Unknown file system[%s]", outputFS.getClass());
-      }
-
-      DataSegment segment = new DataSegment(
-          config.getDataSource(),
-          interval,
-          config.getVersion(),
-          loadSpec,
-          dimensionNames,
-          metricNames,
-          config.getShardSpec(bucket).getActualSpec(),
-          SegmentUtils.getVersionFromDir(mergedBase),
-          size
-      );
-
-      // retry 1 minute
-      boolean success = false;
-      for (int i = 0; i < 6; i++) {
-        if (renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
-          log.info("Successfully renamed [%s] to [%s]", indexZipFilePath, finalIndexZipFilePath);
-          success = true;
-          break;
-        } else {
-          log.info("Failed to rename [%s] to [%s]", indexZipFilePath, finalIndexZipFilePath);
-          try {
-            Thread.sleep(10000);
-            context.progress();
-          }
-          catch (InterruptedException e) {
-            throw new ISE(
-                "Thread error in retry loop for renaming [%s] to [%s]",
-                indexZipFilePath.toUri().getPath(),
-                finalIndexZipFilePath.toUri().getPath()
-            );
-          }
-        }
-      }
-
-      if (!success) {
-        if (!outputFS.exists(indexZipFilePath)) {
-          throw new ISE("File [%s] does not exist after retry loop.", indexZipFilePath.toUri().getPath());
-        }
-
-        if (outputFS.getFileStatus(indexZipFilePath).getLen() == outputFS.getFileStatus(finalIndexZipFilePath)
-                                                                         .getLen()) {
-          outputFS.delete(indexZipFilePath, true);
-        } else {
-          outputFS.delete(finalIndexZipFilePath, true);
-          if (!renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
-            throw new ISE(
-                "Files [%s] and [%s] are different, but still cannot rename after retry loop",
-                indexZipFilePath.toUri().getPath(),
-                finalIndexZipFilePath.toUri().getPath()
-            );
-          }
-        }
-      }
     }
 
     private boolean renameIndexFiles(
@@ -626,6 +531,172 @@ public class IndexGeneratorJob implements Jobby
     {
       log.info("Creating new ZipEntry[%s]", name);
       out.putNextEntry(new ZipEntry(name));
+    }
+
+    private void serializeOutIndexForDFS(Context context, Bucket bucket, File mergedBase, List<String> dimensionNames, Interval interval, int attemptNumber)  throws IOException{
+      FileSystem fileSystem = FileSystem.get(context.getConfiguration());
+      Path indexBasePath = config.makeSegmentOutputPath(fileSystem, bucket);
+      Path indexZipFilePath = new Path(indexBasePath, String.format("index.zip.%s", attemptNumber));
+      final FileSystem infoFS = config.makeDescriptorInfoDir().getFileSystem(context.getConfiguration());
+      final FileSystem outputFS = indexBasePath.getFileSystem(context.getConfiguration());
+
+      outputFS.mkdirs(indexBasePath);
+
+      Exception caughtException = null;
+      ZipOutputStream out = null;
+      long size = 0;
+      try {
+        out = new ZipOutputStream(new BufferedOutputStream(outputFS.create(indexZipFilePath), 256 * 1024));
+
+        List<String> filesToCopy = Arrays.asList(mergedBase.list());
+
+        for (String file : filesToCopy) {
+          size += copyFile(context, out, mergedBase, file);
+        }
+      }
+      catch (Exception e) {
+        caughtException = e;
+      }
+      finally {
+        if (caughtException == null) {
+          Closeables.close(out, false);
+        } else {
+          Closeables.closeQuietly(out);
+          throw Throwables.propagate(caughtException);
+        }
+      }
+
+      Path finalIndexZipFilePath = new Path(indexBasePath, "index.zip");
+      final URI indexOutURI = finalIndexZipFilePath.toUri();
+      ImmutableMap<String, Object> loadSpec;
+      if (outputFS instanceof NativeS3FileSystem) {
+        loadSpec = ImmutableMap.<String, Object>of(
+            "type", "s3_zip",
+            "bucket", indexOutURI.getHost(),
+            "key", indexOutURI.getPath().substring(1) // remove the leading "/"
+        );
+      } else if (outputFS instanceof LocalFileSystem) {
+        loadSpec = ImmutableMap.<String, Object>of(
+            "type", "local",
+            "path", indexOutURI.getPath()
+        );
+      } else if (outputFS instanceof DistributedFileSystem) {
+        loadSpec = ImmutableMap.<String, Object>of(
+            "type", "hdfs",
+            "path", indexOutURI.getPath()
+        );
+      } else {
+        throw new ISE("Unknown file system[%s]", outputFS.getClass());
+      }
+
+      DataSegment segment = new DataSegment(
+          config.getDataSource(),
+          interval,
+          config.getVersion(),
+          loadSpec,
+          dimensionNames,
+          metricNames,
+          config.getShardSpec(bucket).getActualSpec(),
+          SegmentUtils.getVersionFromDir(mergedBase),
+          size
+      );
+
+      // retry 1 minute
+      boolean success = false;
+      for (int i = 0; i < 6; i++) {
+        if (renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
+          log.info("Successfully renamed [%s] to [%s]", indexZipFilePath, finalIndexZipFilePath);
+          success = true;
+          break;
+        } else {
+          log.info("Failed to rename [%s] to [%s]", indexZipFilePath, finalIndexZipFilePath);
+          try {
+            Thread.sleep(10000);
+            context.progress();
+          }
+          catch (InterruptedException e) {
+            throw new ISE(
+                "Thread error in retry loop for renaming [%s] to [%s]",
+                indexZipFilePath.toUri().getPath(),
+                finalIndexZipFilePath.toUri().getPath()
+            );
+          }
+        }
+
+      if (!success) {
+        if (!outputFS.exists(indexZipFilePath)) {
+          throw new ISE("File [%s] does not exist after retry loop.", indexZipFilePath.toUri().getPath());
+        }
+
+        if (outputFS.getFileStatus(indexZipFilePath).getLen() == outputFS.getFileStatus(finalIndexZipFilePath)
+                                                                         .getLen()) {
+          outputFS.delete(indexZipFilePath, true);
+        } else {
+          outputFS.delete(finalIndexZipFilePath, true);
+          if (!renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
+            throw new ISE(
+                "Files [%s] and [%s] are different, but still cannot rename after retry loop",
+                indexZipFilePath.toUri().getPath(),
+                finalIndexZipFilePath.toUri().getPath()
+            );
+          }
+        }
+      }
+      }
+
+      if (!success) {
+        if (!outputFS.exists(indexZipFilePath)) {
+          throw new ISE("File [%s] does not exist after retry loop.", indexZipFilePath.toUri().getPath());
+        }
+
+        if (outputFS.getFileStatus(indexZipFilePath).getLen() == outputFS.getFileStatus(finalIndexZipFilePath)
+                                                                         .getLen()) {
+          outputFS.delete(indexZipFilePath, true);
+        } else {
+          outputFS.delete(finalIndexZipFilePath, true);
+          if (!renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
+            throw new ISE(
+                "Files [%s] and [%s] are different, but still cannot rename after retry loop",
+                indexZipFilePath.toUri().getPath(),
+                finalIndexZipFilePath.toUri().getPath()
+            );
+          }
+        }
+      }
+      }
+
+    private void serializeOutIndexForCassandra(Context context, Bucket bucket, File mergedBase, List<String> dimensionNames, Interval interval, int attemptNumber) throws IOException, URISyntaxException {
+     
+    final FileSystem intermediateFS = config.makeDescriptorInfoDir().getFileSystem(context.getConfiguration());
+    URI uri = new URI(config.getSegmentOutputPath());
+     
+     CassandraDataSegmentConfig cassandraDataSegmentConfig = new CassandraDataSegmentConfig();
+     cassandraDataSegmentConfig.host = uri.getHost()+":"+uri.getPort();
+     cassandraDataSegmentConfig.keyspace = uri.getPath().substring(1);
+        
+     CassandraDataSegmentPusher cassandraDataSegmentPusher = new CassandraDataSegmentPusher(cassandraDataSegmentConfig, HadoopDruidIndexerConfig.jsonMapper);
+     long size = 0;
+    ImmutableMap<String, Object> loadSpec = ImmutableMap.<String, Object>of();
+    
+     DataSegment segment = new DataSegment(
+          config.getDataSource(),
+          interval,
+          config.getVersion(),
+          loadSpec ,
+          dimensionNames,
+          metricNames,
+          config.getShardSpec(bucket).getActualSpec(),
+          SegmentUtils.getVersionFromDir(mergedBase),
+          size
+      );
+     
+      segment = cassandraDataSegmentPusher.push(mergedBase, segment);
+             
+      final Path descriptorPath = config.makeDescriptorInfoPath(segment);
+      log.info("Writing descriptor to path[%s]", descriptorPath);
+      intermediateFS.mkdirs(descriptorPath.getParent());
+      writeSegmentDescriptor(intermediateFS, segment, descriptorPath);
+      
     }
   }
 

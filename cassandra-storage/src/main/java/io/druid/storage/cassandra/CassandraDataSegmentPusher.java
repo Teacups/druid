@@ -60,7 +60,7 @@ public class CassandraDataSegmentPusher extends CassandraStorage implements Data
   @Override
   public String getPathForHadoop(String dataSource)
   {
-    throw new UnsupportedOperationException("Cassandra storage does not support indexing via Hadoop");
+      return "cassandra://" + config.getHost() + "/" + config.getKeyspace();
   }
 
   @Override
