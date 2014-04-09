@@ -32,6 +32,12 @@
     </parent>
 
     <dependencies>
+        <dependency>
+            <groupId>io.druid.extensions</groupId>
+            <artifactId>druid-cassandra-storage</artifactId>
+            <version>${project.parent.version}</version>
+        </dependency>
+
          <dependency>
             <groupId>io.druid</groupId>
             <artifactId>druid-server</artifactId>
